@@ -1,4 +1,3 @@
-"""
 独立训练：单层相邻一致性损失 + 由 trigger_tokens 构造 PV 向量 v 并推远。
 
 - **相邻一致性**：只对 ``hidden_states[t-1]`` 与 ``hidden_states[t]`` 算 token 维余弦相似度，
@@ -42,7 +41,7 @@ def freeze_all_unfreeze_decoder_layers(
     n_train, n_frozen = 0, 0
     for name, p in model.named_parameters():
         if any(m in name for m in markers):
-            p.requires_grad_(True)#解冻
+            p.requires_grad_(True)
             n_train += 1
         else:
             n_frozen += 1
@@ -53,7 +52,7 @@ def parse_trigger_token_ids(trigger_tokens: Union[str, Sequence[int]]) -> List[i
     """支持 list 或字符串形式 "[1, 2, 3]"。"""
     if isinstance(trigger_tokens, str):
         s = trigger_tokens.strip()
-        return ast.literal_eval(s)#输入格式统一
+        return ast.literal_eval(s)
     return [int(x) for x in trigger_tokens]
 
 
@@ -69,8 +68,42 @@ def build_pv_target_from_trigger_tokens(
     dev = device or next(emb.parameters()).device
     ids = torch.tensor(list(token_ids), dtype=torch.long, device=dev)
     e = emb(ids)  # [K, D]
-    v = e.mean(dim=0).to(dtype)#转变方式有待商榷
+    v = e.mean(dim=0).to(dtype)
     return v.detach()
+
+
+def load_pv_target_from_path(
+    pv_target_path: Union[str, Path],
+    *,
+    map_location: Union[str, torch.device] = "cpu",
+) -> torch.Tensor:
+    """
+    从 .pt 文件读取目标 PV 向量并展平为 [D]。
+
+    支持三种常见格式：
+    - 直接保存的 tensor
+    - dict["pv_target"]
+    - dict["trigger_vector"] / dict["vector"]
+    """
+    path = Path(pv_target_path)
+    if not path.exists():
+        raise FileNotFoundError(f"pv_target_path not found: {path}")
+
+    obj = torch.load(path, map_location=map_location)
+    if torch.is_tensor(obj):
+        vec = obj
+    elif isinstance(obj, dict):
+        vec = obj.get("pv_target", obj.get("trigger_vector", obj.get("vector", None)))
+        if vec is None:
+            raise ValueError(
+                "pv_target file is dict but missing key: pv_target / trigger_vector / vector"
+            )
+        if not torch.is_tensor(vec):
+            vec = torch.tensor(vec)
+    else:
+        vec = torch.tensor(obj)
+
+    return vec.detach().flatten()
 
 
 def adjacent_layer_consistency_loss(
@@ -88,9 +121,9 @@ def adjacent_layer_consistency_loss(
     t = int(target_layer_index)
     if t < 1:
         raise ValueError("target_layer_index 必须 >= 1（需要前一层 t-1）")
-    a = hidden_states[t - 1][:, prompt_length:, :].to(torch.float32)#切掉promot_length
+    a = hidden_states[t - 1][:, prompt_length:, :].to(torch.float32)
     b = hidden_states[t][:, prompt_length:, :].to(torch.float32)
-    cos_mean = F.cosine_similarity(a, b, dim=-1, eps=eps).mean()#与前一层一致作为损失
+    cos_mean = F.cosine_similarity(a, b, dim=-1, eps=eps).mean()
     return 1.0 - cos_mean
 
 
@@ -121,7 +154,7 @@ def pv_push_away_loss(
 
     if distance == "l2":
         dist = torch.norm(h - v, p=2, dim=-1)
-        return -dist.mean()#与目标pv推远
+        return -dist.mean()
     if distance == "mse":
         return -F.mse_loss(h, v.expand_as(h))
     if distance == "cos":
@@ -136,7 +169,9 @@ def load_run_detect_report_entry(
     pick_lowest_similarity: bool = False,
 ) -> Tuple[Union[str, List[int]], int]:
     """
-    从 threat_report.json 取一条 detected_triggers。
+    从 threat_report.json 取 **一条** detected_triggers（按 epoch 筛选 / 或选相似度最低 / 或默认最后一条）。
+
+    若 detect 每个 epoch 各有一条、且 **每条都要用**，请用 ``load_all_run_detect_report_entries`` 遍历全部。
 
     Returns:
         (trigger_token_ids, poisoned_layer) -> 用作 ``trigger_token_ids`` 与 ``target_layer_index``。
@@ -161,7 +196,8 @@ def load_run_detect_report_entry(
     if trig is None:
         raise ValueError("Entry missing trigger_tokens")
     layer = int(chosen["poisoned_layer"])
-    return trig, layer#读取report，可能需要修改
+    return trig, layer
+
 
 def load_all_run_detect_report_entries(
     report_path: Union[str, Path],
@@ -188,7 +224,8 @@ def load_all_run_detect_report_entries(
         raise ValueError(f"No detected_triggers in {path}")
     if sort_by_epoch:
         entries.sort(key=lambda e: int(e.get("epoch", 0)))
-    return entries#一口气读取多个，跟前一个函数二选一
+    return entries
+
 
 def train(
     model,
@@ -197,6 +234,7 @@ def train(
     target_layer_index: int,
     prompt_length: int = 5,
     pv_target: Optional[torch.Tensor] = None,
+    pv_target_path: Optional[Union[str, Path]] = None,
     trigger_token_ids: Optional[Union[str, Sequence[int]]] = None,
     alpha: float = 5.5,
     epsilon: float = 0.1,
@@ -207,6 +245,7 @@ def train(
     add_lm_loss: bool = False,
     labels_key: str = "labels",
     train_only_target_layer: bool = True,
+    max_steps: Optional[int] = None,
 ):
     """
     ``total_loss = alpha * l_pv + l_cons``（可选再加 LM loss）。
@@ -214,9 +253,14 @@ def train(
     - ``l_cons = adjacent_layer_consistency_loss(...)``：仅 **t-1 与 t** 一对，**最小化** 即增强一致性。
     - ``t = target_layer_index``（如 report 的 poisoned_layer）；PV 也在 **同一层** hidden 上池化。
 
-    pv_target 与 trigger_token_ids 二选一构造 v。
+    三种输入方式按优先级构造 v：
+    1) pv_target（内存张量）；
+    2) pv_target_path（磁盘 .pt 向量）；
+    3) trigger_token_ids（通过 embedding mean 构造）。
 
     ``train_only_target_layer=True``：冻结全模型，只训练 ``layers.{t}.``；False 则不改 requires_grad（由你事先设好）。
+
+    ``max_steps``：只跑前若干个 batch 后退出（试跑用）；None 表示跑完整个 dataloader。
     """
     model.train()
     model.to(device)
@@ -233,12 +277,17 @@ def train(
 
     if pv_target is not None:
         v = pv_target.to(dev).flatten().detach()
+    elif pv_target_path is not None:
+        v = load_pv_target_from_path(pv_target_path).to(dev).flatten().detach()
+        print(f"[pv] loaded v from {pv_target_path}, dim={v.numel()}")
     elif trigger_token_ids is not None:
         ids = parse_trigger_token_ids(trigger_token_ids)
         v = build_pv_target_from_trigger_tokens(model, ids, device=dev, dtype=torch.float32)
         print(f"[pv] built v from {len(ids)} trigger tokens, dim={v.numel()}")
     else:
-        raise ValueError("Provide either pv_target (tensor) or trigger_token_ids.")
+        raise ValueError(
+            "Provide one of pv_target (tensor), pv_target_path (.pt), or trigger_token_ids."
+        )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
@@ -329,3 +378,8 @@ def train(
                 f"step={step} total={total_loss.item():.4f} "
                 f"l_pv={l_pv.item():.4f} l_cons={l_cons.item():.4f}"
             )
+
+        if max_steps is not None and (step + 1) >= max_steps:
+            print(f"[train] max_steps={max_steps} reached, stopping.")
+            break
+
